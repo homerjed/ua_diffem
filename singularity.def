@@ -1,0 +1,78 @@
+Bootstrap: docker
+From: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+%environment
+    export PATH="/usr/local/bin:/app/venv/bin:${PATH}"
+    export PYTHONPATH="/workspace:/linked_flow:${PYTHONPATH:-}"
+    export MPLBACKEND="Agg"
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 \
+        python3.12-venv \
+        python3.12-dev \
+        python3-pip \
+        build-essential \
+        git \
+        gfortran \
+        pkg-config \
+        libopenblas-dev \
+        libcfitsio-dev \
+        && rm -rf /var/lib/apt/lists/*
+
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+
+    python3 -m venv /app/venv
+    . /app/venv/bin/activate
+    pip install --upgrade pip setuptools wheel
+
+    pip install --no-cache-dir \
+        "jax[cuda12]>=0.9.1" \
+        cython \
+        numpy \
+        scipy \
+        matplotlib \
+        tqdm \
+        optax \
+        equinox \
+        jaxtyping \
+        einops \
+        einx \
+        datasets \
+        cloudpickle \
+        beartype \
+        pillow \
+        "glass==2026.1" \
+        healpy
+
+%runscript
+    if [ $# -eq 0 ]; then
+        exec /bin/bash
+    else
+        exec "$@"
+    fi
+
+%labels
+    Author ua_diffem
+    Version 0.1.0-spherical
+    Python 3.12
+    CUDA 12.6
+    Package-Manager pip
+
+%help
+    UA-DiffEM spherical weak-lensing runtime.
+
+    This image expects the spherical UA-DiffEM checkout bind-mounted at
+    /workspace. If the sibling linked_flow checkout is not packaged inside the
+    image, bind it to /linked_flow so imports of `ua_flow` and `linked_flow`
+    resolve:
+
+      singularity exec --nv \
+        -B /path/to/ua_diffem:/workspace \
+        -B /path/to/linked_flow:/linked_flow \
+        ua-diffem-spherical.sif \
+        python -m ua_diffem.scripts.train_spherical --train_size 32 --em_steps 1
+
+    Helper scripts are available in ./scripts.

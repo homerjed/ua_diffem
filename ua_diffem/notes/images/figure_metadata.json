@@ -1,0 +1,10 @@
+{
+  "copied": {
+    "metric_distributions.png": "/u/jhome/linked_flow/runs/ua_diffem/my_shear_run2/quantitative_reconstruction/metric_distributions.png",
+    "training_preview.png": "/u/jhome/linked_flow/runs/ua_diffem/my_shear_run2/reconstructions/reconstructions_em_184.png",
+    "visual_examples.png": "/u/jhome/linked_flow/runs/ua_diffem/my_shear_run2/visual_examples/visual_examples.png",
+    "weak_lensing_statistics.png": "/u/jhome/linked_flow/runs/ua_diffem/my_shear_run2/weak_lensing_statistics/weak_lensing_statistics.png"
+  },
+  "message": "Missing plotting dependency. Run this script in the project scientific Python environment with numpy and matplotlib installed.",
+  "mode": "copied_existing_run_outputs"
+}

@@ -1,0 +1,64 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+
+# Local environments
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Packaging/build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Test/type/lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Jupyter/IPython
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# UA-DiffEM training outputs and checkpoints
+runs/
+datasets/
+glass_spherical_ks_outputs/
+*.eqx
+*.npy
+*.npz
+*.log
+*.out
+*.err
+
+# Healpy/GLASS and astronomy data products
+*.fits
+*.fits.gz
+
+# Singularity/Apptainer images and build scratch
+*.sif
+*.sandbox/
+singularity-cache/
+apptainer-cache/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.codex
