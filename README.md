@@ -1,4 +1,4 @@
-# UA-DiffEM
+<h1 align="center">UA-DiffEM</h1>
 
 This folder contains a deliberately small example of using an uncertainty-aware
 flow matching posterior inside the DiffEM loop from
@@ -141,7 +141,7 @@ Example qualitative panel from a spherical HEALPix run
 
 <p align="center">
   <img
-    src="runs/ua_diffem/spherical_basic_2/reconstructions/reconstructions_em_10.png"
+    src="assets/spherical_reconstruction_preview.png"
     alt="Spherical weak-lensing reconstruction preview"
     width="100%"
   />
@@ -154,7 +154,7 @@ Example qualitative panel from a planar weak-lensing shear run
 
 <p align="center">
   <img
-    src="runs/ua_diffem/my_shear_run3/reconstructions/reconstructions_em_453.png"
+    src="assets/planar_shear_reconstruction_preview.png"
     alt="Planar shear reconstruction preview"
     width="100%"
   />
