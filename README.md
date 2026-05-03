@@ -139,14 +139,26 @@ Outputs go to `runs/ua_diffem/mnist_basic/` by default:
 Example qualitative panel from a spherical HEALPix run
 (`runs/ua_diffem/spherical_basic_2/`):
 
-![Spherical weak-lensing reconstruction preview](runs/ua_diffem/spherical_basic_2/reconstructions/reconstructions_em_10.png)
+<p align="center">
+  <img
+    src="runs/ua_diffem/spherical_basic_2/reconstructions/reconstructions_em_10.png"
+    alt="Spherical weak-lensing reconstruction preview"
+    width="100%"
+  />
+</p>
 
 ## Planar Shear Reconstruction Preview
 
 Example qualitative panel from a planar weak-lensing shear run
 (`runs/ua_diffem/my_shear_run3/`):
 
-![Planar shear reconstruction preview](runs/ua_diffem/my_shear_run3/reconstructions/reconstructions_em_453.png)
+<p align="center">
+  <img
+    src="runs/ua_diffem/my_shear_run3/reconstructions/reconstructions_em_453.png"
+    alt="Planar shear reconstruction preview"
+    width="100%"
+  />
+</p>
 
 ## Shear Evaluation Folders
 
