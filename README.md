@@ -25,17 +25,21 @@ then reused for every E-step; it is not regenerated at each iteration or epoch.
   a spatially conditioned UNet that predicts velocity mean and log-sigma.
 - `diffem.py`: DiffEM-specific pieces: the known corruption channel, E-step,
   M-step, optimizer, EMA tracking, and checkpoint helpers.
-- `dit.py`: a compact optional image-conditioned DiT-style posterior network.
+- `models/dit.py`: a compact optional image-conditioned DiT-style posterior network.
 - `train_mnist.py`: a runnable MNIST inpainting/noisy-observation example.
 - `train_shear.py`: a runnable toy weak-lensing shear inversion example.
 - `train_spherical.py`: spherical weak-lensing DiffEM on HEALPix maps using
   GLASS, healpy, and a DeepSphere-style velocity network.
+- `train_spherical_gaussian.py`: same spherical setup with a Gaussian
+  convergence prior, so the latent prior and shear/noise observation model are
+  linear-Gaussian.
 - `shear.py`: shared synthetic-shear dataset and Kaiser-Squires utilities.
 - `shear/glass_maps.py`: GLASS/HEALPix spherical map generation and spherical
   shear corruption utilities.
-- `spherical_unet.py`: DeepSphere-style Chebyshev graph-convolution U-Net for
+- `models/spherical_unet.py`: DeepSphere-style Chebyshev graph-convolution U-Net for
   UA-flow velocity prediction on NESTED HEALPix maps.
-- `notes/`: introductory weak-lensing notes with reproducible shear figures.
+- `notes/`: introductory planar weak-lensing notes plus a separate spherical
+  weak-lensing simulation note, with reproducible shear figures.
 - `shear_tests/`: evaluation folders for saved shear runs.
 
 ## Run
@@ -75,6 +79,29 @@ python -m ua_diffem.scripts.train_spherical \
   --posterior_sample_steps 1
 ```
 
+Run the linear-Gaussian spherical variant:
+
+```bash
+python -m ua_diffem.scripts.train_spherical_gaussian \
+  --train_size 8 \
+  --nside 8 \
+  --em_steps 1 \
+  --m_steps_per_em 1 \
+  --batch_size 2 \
+  --posterior_batch_size 2 \
+  --posterior_sample_steps 1
+```
+
+The same trainer also accepts `--prior_family gaussian` or
+`--prior_family lognormal`; the Gaussian entry point just sets the default run
+folder, prior family, CAMB-backed convergence power spectrum, and a smaller
+physical shear-noise level for convenience. The default spherical script uses a
+toy spectrum
+`C_ell = A (ell + 1)^(-spectral_index) exp[-damping ell (ell + 1)]`; pass
+`--kappa_power_spectrum camb` to either script for a cosmological weak-lensing
+convergence spectrum from CAMB and a Smail source distribution. The exact
+`C_ell` used for a run is saved to `out/kappa_power_spectrum.npz`.
+
 For the spherical example, build the CUDA/GLASS/healpy runtime with:
 
 ```bash
@@ -106,6 +133,20 @@ Outputs go to `runs/ua_diffem/mnist_basic/` by default:
 - `states/state.eqx` and `states/state_em_XX.eqx`
 - `reconstructions/reconstructions_em_XX.png` preview panels with truth,
   measurement, reconstruction, and uncertainty rows
+
+## Spherical Weak-Lensing Reconstruction Preview
+
+Example qualitative panel from a spherical HEALPix run
+(`runs/ua_diffem/spherical_basic_2/`):
+
+![Spherical weak-lensing reconstruction preview](runs/ua_diffem/spherical_basic_2/reconstructions/reconstructions_em_10.png)
+
+## Planar Shear Reconstruction Preview
+
+Example qualitative panel from a planar weak-lensing shear run
+(`runs/ua_diffem/my_shear_run3/`):
+
+![Planar shear reconstruction preview](runs/ua_diffem/my_shear_run3/reconstructions/reconstructions_em_453.png)
 
 ## Shear Evaluation Folders
 

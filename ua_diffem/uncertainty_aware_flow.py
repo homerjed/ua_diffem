@@ -20,8 +20,7 @@ class SpatialConditionedUNet2D(eqx.Module):
     """UNet posterior network for UA flow matching.
 
     The model predicts a velocity mean and log standard deviation. The corrupted
-    observation is passed as spatial conditioning channels `q`, which is the
-    most direct fit for image inverse problems such as MNIST inpainting.
+    observation is passed as spatial conditioning channels `q`.
     """
 
     backbone: BaseUNet
@@ -164,7 +163,7 @@ def build_ua_flow(config: UAFlowConfig, *, key: PRNGKeyArray) -> UAFlow:
             key=key,
         )
     elif config.model_name == "dit":
-        from .dit import BasicDiT
+        from .models import BasicDiT
 
         model = BasicDiT(
             image_size=config.image_size,
@@ -179,7 +178,7 @@ def build_ua_flow(config: UAFlowConfig, *, key: PRNGKeyArray) -> UAFlow:
             key=key,
         )
     elif config.model_name == "spherical_unet":
-        from .spherical_unet import SphericalDeepSphereUNet
+        from .models import SphericalDeepSphereUNet
 
         model = SphericalDeepSphereUNet(
             nside=config.nside,

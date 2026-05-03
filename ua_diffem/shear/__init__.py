@@ -10,16 +10,32 @@ from .shear import (
     reverse_standardize,
     standardize_targets,
 )
+from .glass_maps import (
+    SphericalShearObservationChannel,
+    camb_lensing_kappa_cls,
+    generate_glass_gaussian_kappa_dataset,
+    generate_glass_lognormal_kappa_dataset,
+    make_kappa_cls,
+    smail_redshift_distribution,
+    spherical_shear_numpy,
+)
 
 __all__ = [
     "ShearObservationChannel",
+    "SphericalShearObservationChannel",
     "apply_standardization",
+    "camb_lensing_kappa_cls",
+    "generate_glass_gaussian_kappa_dataset",
+    "generate_glass_lognormal_kappa_dataset",
     "generate_lognormal_kappa_dataset",
     "kaiser_squires_inverse_jax",
     "kaiser_squires_shear_jax",
     "kaiser_squires_shear_numpy",
     "ks_kernel_jax",
     "ks_kernel_numpy",
+    "make_kappa_cls",
     "reverse_standardize",
+    "smail_redshift_distribution",
+    "spherical_shear_numpy",
     "standardize_targets",
 ]

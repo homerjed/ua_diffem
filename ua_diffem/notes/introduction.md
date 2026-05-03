@@ -74,10 +74,13 @@ we see a slightly magnified and sheared image.
 
 For a small image patch, the lens mapping can be summarized by the Jacobian
 
-```text
-A = [[1 - kappa - gamma1,  -gamma2],
-     [        -gamma2,  1 - kappa + gamma1]]
-```
+$$
+A =
+\begin{pmatrix}
+1 - \kappa - \gamma_1 & -\gamma_2 \\
+-\gamma_2 & 1 - \kappa + \gamma_1
+\end{pmatrix}.
+$$
 
 The terms mean:
 
@@ -86,7 +89,7 @@ The terms mean:
 - `gamma1`: shear aligned with the coordinate axes. Positive and negative
   values stretch along orthogonal directions.
 - `gamma2`: shear aligned at 45 degrees relative to the axes.
-- `gamma = gamma1 + i gamma2`: complex shear, a compact way to represent the
+- `$\gamma = \gamma_1 + i \gamma_2$`: complex shear, a compact way to represent the
   two components.
 
 In observational cosmology, shear is inferred statistically from many galaxy
@@ -100,27 +103,34 @@ Gaussian noise and masks are added.
 Both convergence and shear can be written as second derivatives of a projected
 lensing potential `psi`:
 
-```text
-kappa  = 0.5 * (psi_11 + psi_22)
-gamma1 = 0.5 * (psi_11 - psi_22)
-gamma2 = psi_12
-```
+$$
+\kappa = \frac{1}{2}\left(\psi_{11} + \psi_{22}\right), \qquad
+\gamma_1 = \frac{1}{2}\left(\psi_{11} - \psi_{22}\right), \qquad
+\gamma_2 = \psi_{12}.
+$$
 
 This is why `kappa` and `gamma` contain related information. They are different
 linear combinations of the same second-derivative field.
 
 In Fourier space, derivatives become multiplication by frequency. If
-`ell = (ell_x, ell_y)` and `ell^2 = ell_x^2 + ell_y^2`, then this project uses
+$\boldsymbol{\ell} = (\ell_x, \ell_y)$ and $\ell^2 = \ell_x^2 + \ell_y^2$,
+then this project uses
 
-```text
-gamma1_hat(ell) = D1(ell) * kappa_hat(ell)
-gamma2_hat(ell) = D2(ell) * kappa_hat(ell)
+$$
+\hat{\gamma}_1(\boldsymbol{\ell}) = D_1(\boldsymbol{\ell}) \, \hat{\kappa}(\boldsymbol{\ell}),
+\qquad
+\hat{\gamma}_2(\boldsymbol{\ell}) = D_2(\boldsymbol{\ell}) \, \hat{\kappa}(\boldsymbol{\ell}),
+$$
 
-D1(ell) = (ell_x^2 - ell_y^2) / ell^2
-D2(ell) = 2 * ell_x * ell_y / ell^2
-```
+with
 
-The zero-frequency mode has `ell^2 = 0`, so it is set to zero in code. This is
+$$
+D_1(\boldsymbol{\ell}) = \frac{\ell_x^2 - \ell_y^2}{\ell^2},
+\qquad
+D_2(\boldsymbol{\ell}) = \frac{2 \ell_x \ell_y}{\ell^2}.
+$$
+
+The zero-frequency mode has $\ell^2 = 0$, so it is set to zero in code. This is
 not just a numerical annoyance: shear cannot determine the absolute constant
 offset of `kappa`.
 
@@ -136,10 +146,11 @@ Relevant code:
 Kaiser-Squires is the classical Fourier-domain inversion from shear to
 convergence. Given observed shear, it estimates
 
-```text
-kappa_hat_KS(ell) = D1(ell) * gamma1_hat(ell)
-                  + D2(ell) * gamma2_hat(ell)
-```
+$$
+\hat{\kappa}_{\mathrm{KS}}(\boldsymbol{\ell}) =
+D_1(\boldsymbol{\ell}) \, \hat{\gamma}_1(\boldsymbol{\ell}) +
+D_2(\boldsymbol{\ell}) \, \hat{\gamma}_2(\boldsymbol{\ell}).
+$$
 
 For a full, noiseless, periodic field this is a natural inverse of the forward
 operator, apart from the missing zero mode. In this project it is used as both:
@@ -162,11 +173,14 @@ fill.
 
 The observation channel in [`../shear.py`](../shear.py) computes
 
-```text
-gamma_true = KS_shear(kappa_true)
-gamma_obs  = (gamma_true + Gaussian noise) * mask
-condition  = gamma_obs / gamma_scale
-```
+$$
+\begin{aligned}
+\gamma_{\mathrm{true}} &= \mathrm{KS\_shear}(\kappa_{\mathrm{true}}), \\
+\eta &\sim \mathcal{N}(0, \sigma_\gamma^2 I), \\
+\gamma_{\mathrm{obs}} &= \left(\gamma_{\mathrm{true}} + \eta\right) \odot m, \\
+\mathrm{condition} &= \gamma_{\mathrm{obs}} / \gamma_{\mathrm{scale}}.
+\end{aligned}
+$$
 
 The model condition has two channels: `gamma1` and `gamma2`. The mask is used to
 zero out unobserved shear pixels. The code standardizes the target `kappa`
@@ -174,27 +188,41 @@ fields for training, but most plots convert back to physical `kappa` units.
 
 The code uses shear `gamma`, not reduced shear
 
-```text
-g = gamma / (1 - kappa)
-```
+$$
+g = \frac{\gamma}{1 - \kappa}.
+$$
 
 Real weak-lensing analyses often work with reduced shear because that is closer
 to what galaxy shapes measure. For this synthetic benchmark, using `gamma`
 keeps the forward model linear and makes the Kaiser-Squires baseline direct.
 
+## Spherical note
+
+The full-sky HEALPix / GLASS / CAMB pipeline is documented separately in
+[`spherical_weak_lensing.md`](spherical_weak_lensing.md). That note is the
+best place to review what the spherical code is doing from a physics
+perspective. It includes:
+
+- the convergence and source-distribution equations behind the CAMB-backed
+  `C_ell`;
+- the harmonic-space relation between spherical convergence and shear;
+- the exact low-`ell` projection, noise model, mask model, and bootstrap
+  inversion used by the code;
+- the provenance of the default cosmological parameters.
+
 ## Why this is an inverse problem
 
 The forward direction is easy:
 
-```text
-kappa -> gamma -> noisy, masked gamma_obs
-```
+$$
+\kappa \to \gamma \to \text{noisy, masked } \gamma_{\mathrm{obs}}.
+$$
 
 The inverse direction is hard:
 
-```text
-gamma_obs -> plausible kappa maps
-```
+$$
+\gamma_{\mathrm{obs}} \to \text{plausible } \kappa \text{ maps}.
+$$
 
 Many different `kappa` maps can be consistent with nearly the same noisy,
 masked observation. Some information is physically absent, some is hidden by
@@ -203,9 +231,9 @@ look confident even when several alternatives remain plausible.
 
 UA-DiffEM treats the target as a conditional distribution:
 
-```text
-p_theta(kappa | gamma_obs)
-```
+$$
+p_\theta\!\left(\kappa \mid \gamma_{\mathrm{obs}}\right).
+$$
 
 The E-step samples reconstructions from the current posterior model. The M-step
 trains the uncertainty-aware flow on those reconstructed clean fields passed
@@ -247,11 +275,13 @@ outputs:
 
 1. Read [`../shear.py`](../shear.py) from top to bottom. It is the smallest
    complete description of the physics-inspired data model.
-2. Run `python ua_diffem/notes/make_shear_figures.py` and inspect the PNGs in
+2. If you are reviewing the full-sky pipeline, read
+   [`spherical_weak_lensing.md`](spherical_weak_lensing.md) next.
+3. Run `python ua_diffem/notes/make_shear_figures.py` and inspect the PNGs in
    `ua_diffem/notes/images/`.
-3. Open a saved `runs/ua_diffem/<run_name>/config.json` and match each dataset
+4. Open a saved `runs/ua_diffem/<run_name>/config.json` and match each dataset
    parameter to the glossary above.
-4. Run `python -m ua_diffem.shear_tests.visual_examples.run --run_name <run_name>`
+5. Run `python -m ua_diffem.shear_tests.visual_examples.run --run_name <run_name>`
    for a trained run, then compare its output with the forward-model figure in
    these notes.
-5. Only after that, read the DiffEM training loop in [`../train_shear.py`](../train_shear.py).
+6. Only after that, read the DiffEM training loop in [`../train_shear.py`](../train_shear.py).

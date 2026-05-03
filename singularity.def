@@ -44,6 +44,7 @@ From: nvidia/cuda:12.6.0-runtime-ubuntu24.04
         cloudpickle \
         beartype \
         pillow \
+        camb \
         "glass==2026.1" \
         healpy
 

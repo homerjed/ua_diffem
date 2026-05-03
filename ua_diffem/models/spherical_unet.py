@@ -29,6 +29,53 @@ class HealpixGraph:
     nside: int
     neighbors: np.ndarray
     laplacian_weights: np.ndarray
+    laplacian_lambda_max: float
+
+
+def _apply_normalized_adjacency_numpy(
+    x: np.ndarray,
+    *,
+    neighbors: np.ndarray,
+    weights: np.ndarray,
+) -> np.ndarray:
+    gathered = x[neighbors]
+    return np.sum(gathered * weights, axis=-1)
+
+
+def _estimate_laplacian_lambda_max(
+    neighbors: np.ndarray,
+    weights: np.ndarray,
+    *,
+    iterations: int = 24,
+) -> float:
+    """Estimate the largest eigenvalue of the normalized graph Laplacian."""
+
+    rng = np.random.default_rng(0)
+    vec = rng.normal(size=(neighbors.shape[0],)).astype(np.float64)
+    vec /= np.linalg.norm(vec) + 1e-12
+
+    for _ in range(max(4, int(iterations))):
+        adjacency_vec = _apply_normalized_adjacency_numpy(
+            vec,
+            neighbors=neighbors,
+            weights=weights,
+        )
+        laplacian_vec = vec - adjacency_vec
+        norm = np.linalg.norm(laplacian_vec)
+        if not np.isfinite(norm) or norm <= 1e-12:
+            return 2.0
+        vec = laplacian_vec / norm
+
+    adjacency_vec = _apply_normalized_adjacency_numpy(
+        vec,
+        neighbors=neighbors,
+        weights=weights,
+    )
+    laplacian_vec = vec - adjacency_vec
+    rayleigh = float(np.dot(vec, laplacian_vec) / (np.dot(vec, vec) + 1e-12))
+    if not np.isfinite(rayleigh) or rayleigh <= 0.0:
+        return 2.0
+    return min(2.0, max(1.0, rayleigh))
 
 
 def build_healpix_graph(nside: int, *, nest: bool = True) -> HealpixGraph:
@@ -48,10 +95,12 @@ def build_healpix_graph(nside: int, *, nest: bool = True) -> HealpixGraph:
         1.0 / np.sqrt(degree[:, None] * neighbor_degree),
         0.0,
     ).astype(np.float32)
+    lambda_max = _estimate_laplacian_lambda_max(safe_neighbors, weights.astype(np.float64))
     return HealpixGraph(
         nside=int(nside),
         neighbors=safe_neighbors,
         laplacian_weights=weights,
+        laplacian_lambda_max=float(lambda_max),
     )
 
 
@@ -62,6 +111,7 @@ class DeepSphereConv(eqx.Module):
     bias: Array
     neighbors: tuple[tuple[int, ...], ...] = eqx.field(static=True)
     laplacian_weights: tuple[tuple[float, ...], ...] = eqx.field(static=True)
+    laplacian_lambda_max: float = eqx.field(static=True)
 
     def __init__(
         self,
@@ -86,12 +136,23 @@ class DeepSphereConv(eqx.Module):
         self.laplacian_weights = tuple(
             tuple(float(value) for value in row) for row in graph.laplacian_weights
         )
+        self.laplacian_lambda_max = float(graph.laplacian_lambda_max)
 
     def _scaled_laplacian(self, x: Array) -> Array:
+        """Apply the Chebyshev-scaled normalized Laplacian.
+
+        With `L = I - D^{-1/2} A D^{-1/2}`, Chebyshev filters use
+        `L_tilde = 2 L / lambda_max - I`, keeping the spectrum in `[-1, 1]`.
+        """
+
         neighbors = jnp.asarray(self.neighbors, dtype=jnp.int32)
         weights = jnp.asarray(self.laplacian_weights, dtype=x.dtype)
         gathered = jnp.take(x, neighbors, axis=1)
-        return -jnp.sum(gathered * weights[None, :, :], axis=-1)
+        normalized_adjacency = jnp.sum(gathered * weights[None, :, :], axis=-1)
+        lambda_max = jnp.asarray(self.laplacian_lambda_max, dtype=x.dtype)
+        scaled_identity = (2.0 / lambda_max) - 1.0
+        scaled_adjacency = 2.0 / lambda_max
+        return scaled_identity * x - scaled_adjacency * normalized_adjacency
 
     def __call__(self, x: Array) -> Array:
         if x.ndim != 2:
@@ -104,7 +165,7 @@ class DeepSphereConv(eqx.Module):
             cheb_terms.append(2.0 * self._scaled_laplacian(cheb_terms[-1]) - cheb_terms[-2])
 
         features = jnp.stack(cheb_terms, axis=0)
-        return jnp.einsum("koi,kin->on", self.weight, features) + self.bias
+        return jnp.einsum("koi, kin -> on", self.weight, features) + self.bias
 
 
 class SphericalResBlock(eqx.Module):
@@ -165,6 +226,56 @@ class SphericalResBlock(eqx.Module):
         return jax.nn.gelu(h + residual)
 
 
+class SphericalDownsample(eqx.Module):
+    """Learned NESTED HEALPix downsampling from four children to one parent."""
+
+    proj: eqx.nn.Linear
+    in_channels: int = eqx.field(static=True)
+    out_channels: int = eqx.field(static=True)
+
+    def __init__(self, in_channels: int, out_channels: int, *, key: PRNGKeyArray):
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.proj = eqx.nn.Linear(self.in_channels * 4, self.out_channels, key=key)
+
+    def __call__(self, x: Array) -> Array:
+        if x.ndim != 2 or x.shape[0] != self.in_channels:
+            raise ValueError(
+                f"`x` must have shape ({self.in_channels},npix), got {x.shape}."
+            )
+        if x.shape[1] % 4 != 0:
+            raise ValueError("HEALPix NESTED downsampling requires npix divisible by 4.")
+
+        n_parent = x.shape[1] // 4
+        grouped = jnp.reshape(x, (self.in_channels, n_parent, 4))
+        flat = jnp.reshape(jnp.transpose(grouped, (1, 0, 2)), (n_parent, self.in_channels * 4))
+        down = jax.vmap(self.proj)(flat)
+        return jnp.transpose(down, (1, 0))
+
+
+class SphericalUpsample(eqx.Module):
+    """Learned NESTED HEALPix upsampling from one parent to four children."""
+
+    proj: eqx.nn.Linear
+    in_channels: int = eqx.field(static=True)
+    out_channels: int = eqx.field(static=True)
+
+    def __init__(self, in_channels: int, out_channels: int, *, key: PRNGKeyArray):
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.proj = eqx.nn.Linear(self.in_channels, self.out_channels * 4, key=key)
+
+    def __call__(self, x: Array) -> Array:
+        if x.ndim != 2 or x.shape[0] != self.in_channels:
+            raise ValueError(
+                f"`x` must have shape ({self.in_channels},npix), got {x.shape}."
+            )
+
+        expanded = jax.vmap(self.proj)(jnp.transpose(x, (1, 0)))
+        expanded = jnp.reshape(expanded, (x.shape[1], self.out_channels, 4))
+        return jnp.reshape(jnp.transpose(expanded, (1, 0, 2)), (self.out_channels, x.shape[1] * 4))
+
+
 class SphericalDeepSphereUNet(eqx.Module):
     """Spherical UA-flow velocity network using DeepSphere Chebyshev layers.
 
@@ -183,9 +294,12 @@ class SphericalDeepSphereUNet(eqx.Module):
     time_in: eqx.nn.Linear
     time_out: eqx.nn.Linear
     encoder_blocks: list[SphericalResBlock]
+    downsample_layers: list[SphericalDownsample]
     down_blocks: list[SphericalResBlock]
     mid_block: SphericalResBlock
+    upsample_layers: list[SphericalUpsample]
     decoder_blocks: list[SphericalResBlock]
+    final_res_block: SphericalResBlock
     output_proj: DeepSphereConv
 
     def __init__(
@@ -218,7 +332,9 @@ class SphericalDeepSphereUNet(eqx.Module):
             build_healpix_graph(self.nside // (2**level), nest=True)
             for level in range(len(self.dims))
         ]
-        key_input, key_time, key_enc, key_down, key_mid, key_dec, key_output = jr.split(key, 7)
+        key_input, key_time, key_enc, key_downsample, key_down, key_mid, key_upsample, key_dec, key_final, key_output = jr.split(
+            key, 10
+        )
         key_time_in, key_time_out = jr.split(key_time)
 
         self.input_proj = DeepSphereConv(
@@ -246,9 +362,19 @@ class SphericalDeepSphereUNet(eqx.Module):
                 jr.split(key_enc, len(self.dims)),
             )
         ]
+        self.downsample_layers = [
+            SphericalDownsample(
+                self.dims[level],
+                self.dims[level + 1],
+                key=layer_key,
+            )
+            for level, layer_key in enumerate(
+                jr.split(key_downsample, max(1, len(self.dims) - 1))[: len(self.dims) - 1]
+            )
+        ]
         self.down_blocks = [
             SphericalResBlock(
-                self.dims[level],
+                self.dims[level + 1],
                 self.dims[level + 1],
                 graphs[level + 1],
                 time_dim=self.time_dim,
@@ -268,6 +394,17 @@ class SphericalDeepSphereUNet(eqx.Module):
             key=key_mid,
         )
 
+        self.upsample_layers = [
+            SphericalUpsample(
+                self.dims[level + 1],
+                self.dims[level],
+                key=layer_key,
+            )
+            for level, layer_key in zip(
+                reversed(range(len(self.dims) - 1)),
+                jr.split(key_upsample, max(1, len(self.dims) - 1))[: len(self.dims) - 1],
+            )
+        ]
         decoder_blocks = []
         current_width = self.dims[-1]
         for level, block_key in zip(
@@ -287,8 +424,17 @@ class SphericalDeepSphereUNet(eqx.Module):
             )
             current_width = self.dims[level]
         self.decoder_blocks = decoder_blocks
-        self.output_proj = DeepSphereConv(
+        self.final_res_block = SphericalResBlock(
+            self.dims[0] * 2,
             self.dims[0],
+            graphs[0],
+            time_dim=self.time_dim,
+            kernel_size=chebyshev_order,
+            dropout=dropout,
+            key=key_final,
+        )
+        self.output_proj = DeepSphereConv(
+            self.dims[0] + self.cond_channels,
             self.channels * 2,
             graphs[0],
             kernel_size=1,
@@ -299,17 +445,6 @@ class SphericalDeepSphereUNet(eqx.Module):
         emb = timestep_embedding(time, self.time_dim)
         emb = jax.nn.gelu(self.time_in(emb))
         return self.time_out(emb)
-
-    @staticmethod
-    def _pool(x: Array) -> Array:
-        channels, npix = x.shape
-        if npix % 4 != 0:
-            raise ValueError("HEALPix NESTED pooling requires npix divisible by 4.")
-        return jnp.reshape(x, (channels, npix // 4, 4)).mean(axis=-1)
-
-    @staticmethod
-    def _unpool(x: Array) -> Array:
-        return jnp.repeat(x, 4, axis=1)
 
     def make_null_condition(self, cond: Array | None) -> Array | None:
         if cond is None:
@@ -337,12 +472,14 @@ class SphericalDeepSphereUNet(eqx.Module):
         if cond.shape[-1] != x.shape[-1]:
             raise ValueError("`cond` and `x` must have the same HEALPix pixel count.")
 
-        n_keys = len(self.encoder_blocks) + len(self.down_blocks) + len(self.decoder_blocks) + 1
+        n_keys = len(self.encoder_blocks) + len(self.down_blocks) + len(self.decoder_blocks) + 2
         block_keys = [None] * n_keys if key is None else list(jr.split(key, n_keys))
         key_idx = 0
 
         time_emb = self._time_embedding(time)
         h = self.input_proj(jnp.concatenate([x, cond], axis=0))
+        # Preserve an early full-resolution feature stream for the final head.
+        r = h
         skips = []
 
         for level, block in enumerate(self.encoder_blocks):
@@ -350,7 +487,7 @@ class SphericalDeepSphereUNet(eqx.Module):
             key_idx += 1
             skips.append(h)
             if level < len(self.down_blocks):
-                h = self._pool(h)
+                h = self.downsample_layers[level](h)
                 h = self.down_blocks[level](h, time_emb, key=block_keys[key_idx])
                 key_idx += 1
 
@@ -360,10 +497,12 @@ class SphericalDeepSphereUNet(eqx.Module):
         for decoder_idx, block in enumerate(self.decoder_blocks):
             level = len(self.dims) - 1 - decoder_idx
             if decoder_idx > 0:
-                h = self._unpool(h)
+                h = self.upsample_layers[decoder_idx - 1](h)
             h = jnp.concatenate([h, skips[level]], axis=0)
             h = block(h, time_emb, key=block_keys[key_idx])
             key_idx += 1
 
-        mean, log_sigma = jnp.split(self.output_proj(h), 2, axis=0)
+        h = jnp.concatenate([h, r], axis=0)
+        h = self.final_res_block(h, time_emb, key=block_keys[key_idx])
+        mean, log_sigma = jnp.split(self.output_proj(jnp.concatenate([h, cond], axis=0)), 2, axis=0)
         return mean, log_sigma

@@ -7,6 +7,8 @@ import argparse
 import json
 import sys
 
+# Allow this script to run both from the repo checkout and alongside a sibling
+# linked_flow checkout used by some local development setups.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LINKED_FLOW_ROOT = _REPO_ROOT.parent / "linked_flow"
 if __package__ in (None, ""):
@@ -19,6 +21,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+from matplotlib import cm, colors
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -33,7 +36,10 @@ from ua_diffem.shear import reverse_standardize, standardize_targets
 from ua_diffem.shear.glass_maps import (
     SphericalShearObservationChannel,
     default_lmax,
+    generate_glass_gaussian_kappa_dataset,
     generate_glass_lognormal_kappa_dataset,
+    make_kappa_cls,
+    project_observable_kappa_numpy,
     reorder_healpix_array,
     spherical_shear_numpy,
 )
@@ -47,11 +53,13 @@ from ua_diffem.utils import (
 
 
 def log(message: str) -> None:
+    """Print a timestamped log message for spherical training runs."""
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[ua_diffem.spherical {timestamp}] {message}", flush=True)
 
 
 def parse_dim_mults(value: str) -> tuple[int, ...]:
+    """Parse a comma-separated list of UNet width multipliers."""
     parts = tuple(int(part.strip()) for part in value.split(",") if part.strip())
     if not parts:
         raise ValueError("`dim_mults` must contain at least one integer.")
@@ -59,6 +67,8 @@ def parse_dim_mults(value: str) -> tuple[int, ...]:
 
 
 def _ring_batch(maps: np.ndarray, *, nside: int) -> np.ndarray:
+    """Convert a batch of HEALPix maps from NESTED to RING ordering."""
+    # healpy's visualization helpers are easiest to use with RING ordering.
     return reorder_healpix_array(
         np.asarray(maps),
         nside=nside,
@@ -67,11 +77,56 @@ def _ring_batch(maps: np.ndarray, *, nside: int) -> np.ndarray:
     )
 
 
+def _mask_preview_maps(maps: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Copy preview maps and replace masked pixels with NaNs."""
+    masked = np.asarray(maps, dtype=np.float32).copy()
+    masked[~mask] = np.nan
+    return masked
+
+
+def _finite_quantile(values: np.ndarray, q: float, *, default: float) -> float:
+    """Return a quantile over finite values, or `default` if none exist."""
+    finite = np.asarray(values, dtype=np.float32)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return float(default)
+    return float(np.quantile(finite, q))
+
+
+def _project_standardized_kappa_batch(
+    maps: np.ndarray | jax.Array,
+    *,
+    nside: int,
+    lmax: int,
+    target_stats: dict[str, float],
+) -> jnp.ndarray:
+    """Project standardized kappa samples into observable space and restandardize."""
+    # Posterior samples live in standardized training space. We temporarily move
+    # back to physical kappa, apply the observable-space projection, then
+    # standardize again so downstream training stays in the model's native scale.
+    maps_np = np.asarray(jax.device_get(maps), dtype=np.float32)
+    if maps_np.ndim != 3 or maps_np.shape[1] != 1:
+        raise ValueError(f"`maps` must have shape (B,1,npix), got {maps_np.shape}.")
+
+    maps_phys = reverse_standardize(maps_np, target_stats)
+    maps_proj = project_observable_kappa_numpy(
+        maps_phys[:, 0],
+        nside=nside,
+        lmax=lmax,
+        input_nest=True,
+        output_nest=True,
+        ell_min=2,
+    )[:, None, :]
+    standardized = (maps_proj - float(target_stats["mean"])) / float(target_stats["std"])
+    return jnp.asarray(standardized, dtype=jnp.float32)
+
+
 def save_spherical_preview(
     run_dir: Path,
     *,
     em_idx: int,
     nside: int,
+    lmax: int,
     clean: np.ndarray,
     observed_condition: np.ndarray,
     kaiser_squires: np.ndarray,
@@ -81,49 +136,77 @@ def save_spherical_preview(
     gamma_scale: float,
     max_columns: int = 4,
 ) -> None:
+    """Save a qualitative reconstruction preview for a single EM iteration."""
     import healpy as hp
 
     ncols = min(int(max_columns), int(clean.shape[0]))
-    clean_phys = clean[:ncols]
-    kaiser_squires_phys = reverse_standardize(kaiser_squires[:ncols], target_stats)
-    posterior_phys = reverse_standardize(posterior[:ncols], target_stats)
+    # Plot all kappa-like quantities after the same low-ell observable projection
+    # so the rows can be compared directly.
+    clean_phys = project_observable_kappa_numpy(
+        clean[:ncols, 0],
+        nside=nside,
+        lmax=lmax,
+        input_nest=True,
+        output_nest=True,
+        ell_min=2,
+    )[:, None, :]
+    kaiser_squires_phys = project_observable_kappa_numpy(
+        reverse_standardize(kaiser_squires[:ncols], target_stats)[:, 0],
+        nside=nside,
+        lmax=lmax,
+        input_nest=True,
+        output_nest=True,
+        ell_min=2,
+    )[:, None, :]
+    posterior_phys = project_observable_kappa_numpy(
+        reverse_standardize(posterior[:ncols], target_stats)[:, 0],
+        nside=nside,
+        lmax=lmax,
+        input_nest=True,
+        output_nest=True,
+        ell_min=2,
+    )[:, None, :]
 
     clean_ring = _ring_batch(clean_phys[:, 0], nside=nside)
     ks_ring = _ring_batch(kaiser_squires_phys[:, 0], nside=nside)
     posterior_ring = _ring_batch(posterior_phys[:, 0], nside=nside)
 
+    mask_ring = _ring_batch(observed_condition[:ncols, 2], nside=nside) > 0.5
+    # Keep latent, reconstruction, and uncertainty rows full-sky in the preview.
+
     kappa_range = np.concatenate([clean_ring, ks_ring, posterior_ring], axis=0)
-    kappa_vmin = float(np.nanquantile(kappa_range, 0.01))
-    kappa_vmax = float(np.nanquantile(kappa_range, 0.99))
+    kappa_vmin = _finite_quantile(kappa_range, 0.01, default=-1.0)
+    kappa_vmax = _finite_quantile(kappa_range, 0.99, default=1.0)
+    if kappa_vmax <= kappa_vmin:
+        kappa_vmin, kappa_vmax = -1.0, 1.0
 
     gamma = observed_condition[:ncols, :2] * gamma_scale
-    mask = observed_condition[:ncols, 2]
     gamma_mag = np.sqrt(np.sum(gamma**2, axis=1))
     gamma_mag_ring = _ring_batch(gamma_mag, nside=nside)
-    mask_ring = _ring_batch(mask, nside=nside) > 0.5
     gamma_mag_ring = gamma_mag_ring.copy()
     gamma_mag_ring[~mask_ring] = np.nan
-    gamma_vmax = float(np.nanquantile(gamma_mag_ring, 0.98))
+    gamma_vmax = _finite_quantile(gamma_mag_ring, 0.98, default=1.0)
     if not np.isfinite(gamma_vmax) or gamma_vmax <= 0.0:
         gamma_vmax = 1.0
 
     uncertainty = np.sqrt(np.maximum(uncertainty[:ncols], 0.0)).mean(axis=1)
     uncertainty_ring = _ring_batch(uncertainty, nside=nside)
-    uncertainty_vmax = float(np.nanquantile(uncertainty_ring, 0.99))
+    uncertainty_vmax = _finite_quantile(uncertainty_ring, 0.99, default=1.0)
     if not np.isfinite(uncertainty_vmax) or uncertainty_vmax <= 0.0:
         uncertainty_vmax = 1.0
 
     rows = [
-        (clean_ring, "truth kappa", "magma", kappa_vmin, kappa_vmax),
-        (gamma_mag_ring, "|gamma obs|", "viridis", 0.0, gamma_vmax),
-        (ks_ring, "Kaiser-Squires", "magma", kappa_vmin, kappa_vmax),
-        (posterior_ring, "reconstruction", "magma", kappa_vmin, kappa_vmax),
-        (uncertainty_ring, "uncertainty", "magma", 0.0, uncertainty_vmax),
+        (clean_ring, r"$\kappa$", "magma", kappa_vmin, kappa_vmax),  # truth kappa
+        (gamma_mag_ring, r"$|\hat{\gamma}|$", "cividis", 0.0, gamma_vmax),  # observed shear magnitude
+        (ks_ring, r"$\hat{\kappa}_{\text{KS}}$", "magma", kappa_vmin, kappa_vmax),  # Kaiser-Squires baseline
+        (posterior_ring, "$\mu_{\kappa|\hat{\gamma}}$", "magma", kappa_vmin, kappa_vmax),  # posterior mean sample
+        (uncertainty_ring, r"$\sigma_{\kappa|\hat{\gamma}}$", "gray_r", 0.0, uncertainty_vmax),  # posterior uncertainty
     ]
 
     nrows = len(rows)
-    fig = plt.figure(figsize=(3.2 * ncols, 8.0), dpi=220)
+    fig = plt.figure(figsize=(3.5 * ncols, 8.0), dpi=220)
     for row_idx, (row_maps, label, cmap, vmin, vmax) in enumerate(rows):
+        row_last_ax = None
         for col_idx in range(ncols):
             hp.mollview(
                 row_maps[col_idx],
@@ -136,16 +219,26 @@ def save_spherical_preview(
                 title="",
                 badcolor="0.55",
             )
+            row_last_ax = fig.axes[-1]
+        if row_last_ax is not None:
+            row_pos = row_last_ax.get_position()
+            cax = fig.add_axes([row_pos.x1 + 0.008, row_pos.y0, 0.012, row_pos.height])
+            mappable = cm.ScalarMappable(
+                norm=colors.Normalize(vmin=vmin, vmax=vmax),
+                cmap=plt.get_cmap(cmap),
+            )
+            colorbar = fig.colorbar(mappable, cax=cax)
+            colorbar.ax.tick_params(labelsize=10)
         fig.text(
-            0.04,
+            0.01,
             0.91 - row_idx * (0.82 / max(1, nrows - 1)),
             label,
             ha="right",
             va="center",
-            fontsize=9,
+            fontsize=18,
         )
 
-    fig.subplots_adjust(left=0.08, right=0.99, top=0.98, bottom=0.02, hspace=0.02, wspace=0.02)
+    fig.subplots_adjust(left=0.08, right=0.93, top=0.98, bottom=0.02, hspace=0.02, wspace=0.02)
     fig.savefig(run_dir / f"reconstructions_em_{em_idx:02d}.png", bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
 
@@ -156,6 +249,7 @@ def save_em_loss_plot(
     validation_steps_by_em: list[list[int]],
     validation_losses_by_em: list[list[float]],
 ) -> None:
+    """Plot M-step training and validation losses across EM iterations."""
     fig, ax = plt.subplots(figsize=(7.0, 3.2), dpi=220)
     colors = ("tab:red", "tab:blue")
     start = 0
@@ -196,31 +290,54 @@ def save_em_loss_plot(
     plt.close(fig)
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
+def build_arg_parser(
+    *,
+    prior_family_default: str = "lognormal",
+    kappa_power_spectrum_default: str = "camb",
+    noise_std_default: float = 0.20,
+    run_dir_default: Path = Path("runs/ua_diffem/spherical_basic"),
+) -> argparse.ArgumentParser:
+    """Build the CLI parser for spherical DiffEM training."""
+    # `train_spherical_gaussian.py` reuses this parser but swaps a few defaults.
     parser = argparse.ArgumentParser(
         description="DiffEM + uncertainty-aware flow matching for spherical weak-lensing maps."
     )
-    parser.add_argument("--run_dir", type=Path, default=Path("runs/ua_diffem/spherical_basic"))
+    parser.add_argument("--run_dir", type=Path, default=run_dir_default)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--train_size", type=int, default=1024)
     parser.add_argument("--preview_size", type=int, default=4)
     parser.add_argument("--dataset_progress_every", type=int, default=25)
 
-    parser.add_argument("--nside", type=int, default=16)
+    parser.add_argument("--prior_family", choices=("lognormal", "gaussian"), default=prior_family_default)
+    parser.add_argument("--nside", type=int, default=32)
     parser.add_argument("--lmax", type=int, default=0)
     parser.add_argument("--glass_amplitude", type=float, default=0.9)
     parser.add_argument("--spectral_index", type=float, default=1.25)
     parser.add_argument("--glass_damping", type=float, default=0.006)
+    parser.add_argument("--kappa_power_spectrum", choices=("toy", "camb"), default=kappa_power_spectrum_default)
+    parser.add_argument("--camb_h0", type=float, default=67.66)
+    parser.add_argument("--camb_ombh2", type=float, default=0.02242)
+    parser.add_argument("--camb_omch2", type=float, default=0.11933)
+    parser.add_argument("--camb_as", type=float, default=2.105e-9)
+    parser.add_argument("--camb_ns", type=float, default=0.9665)
+    parser.add_argument("--camb_mnu", type=float, default=0.06)
+    parser.add_argument("--camb_nonlinear", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--source_z0", type=float, default=0.5)
+    parser.add_argument("--source_alpha", type=float, default=2.0)
+    parser.add_argument("--source_beta", type=float, default=1.5)
+    parser.add_argument("--source_zmax", type=float, default=3.0)
+    parser.add_argument("--source_nz", type=int, default=256)
     parser.add_argument("--gaussian_sigma", type=float, default=0.8)
-    parser.add_argument("--noise_std", type=float, default=0.55)
+    parser.add_argument("--gaussian_remove_dipole", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--noise_std", type=float, default=noise_std_default)
     parser.add_argument("--mask_fraction", type=float, default=1.0)
     parser.add_argument("--hole_radius_deg", type=float, default=5.5)
     parser.add_argument("--num_holes", type=int, default=22)
 
     parser.add_argument("--em_steps", type=int, default=500)
-    parser.add_argument("--m_steps_per_em", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--posterior_batch_size", type=int, default=4)
+    parser.add_argument("--m_steps_per_em", type=int, default=500)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--posterior_batch_size", type=int, default=8)
     parser.add_argument("--posterior_sample_steps", type=int, default=15)
     parser.add_argument("--posterior_solver", choices=("euler", "heun"), default="euler")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
@@ -238,8 +355,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ema_rate", type=float, default=0.999)
 
     parser.add_argument("--model_name", choices=("spherical_unet",), default="spherical_unet")
-    parser.add_argument("--model_dim", type=int, default=32)
-    parser.add_argument("--dim_mults", type=str, default="1,2")
+    parser.add_argument("--model_dim", type=int, default=64)
+    parser.add_argument("--dim_mults", type=str, default="2,2,2")
     parser.add_argument("--time_dim", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--chebyshev_order", type=int, default=3)
@@ -249,8 +366,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    args = build_arg_parser().parse_args()
+def main(
+    argv: list[str] | None = None,
+    *,
+    prior_family_default: str = "lognormal",
+    kappa_power_spectrum_default: str = "toy",
+    noise_std_default: float = 0.20,
+    run_dir_default: Path = Path("runs/ua_diffem/spherical_basic"),
+) -> None:
+    """Run the spherical DiffEM training loop with optional default overrides."""
+    args = build_arg_parser(
+        prior_family_default=prior_family_default,
+        kappa_power_spectrum_default=kappa_power_spectrum_default,
+        noise_std_default=noise_std_default,
+        run_dir_default=run_dir_default,
+    ).parse_args(argv)
     args.run_dir.mkdir(parents=True, exist_ok=True)
     states_dir = args.run_dir / "states"
     reconstructions_dir = args.run_dir / "reconstructions"
@@ -259,6 +389,8 @@ def main() -> None:
     reconstructions_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Fail fast on argument combinations that would break validation splits,
+    # posterior sampling, or device sharding later in the run.
     if args.train_size < 2:
         raise ValueError("`train_size` must be at least 2 for M-step validation.")
     if args.preview_size < 1:
@@ -295,25 +427,81 @@ def main() -> None:
 
     lmax = default_lmax(args.nside) if args.lmax <= 0 else int(args.lmax)
     dataset_progress_every = max(0, int(args.dataset_progress_every))
-    log(
-        "Generating GLASS log-normal convergence maps on the HEALPix sphere "
-        f"(train_size={args.train_size}, nside={args.nside}, lmax={lmax})."
-    )
-    kappa_train_np = generate_glass_lognormal_kappa_dataset(
-        n_samples=args.train_size,
-        nside=args.nside,
-        lmax=lmax,
-        seed=args.seed,
+    log(f"Building {args.kappa_power_spectrum!r} convergence power spectrum through lmax={lmax}.")
+    cl_kappa = make_kappa_cls(
+        lmax,
+        power_spectrum=args.kappa_power_spectrum,
         amplitude=args.glass_amplitude,
         spectral_index=args.spectral_index,
         damping=args.glass_damping,
-        gaussian_sigma=args.gaussian_sigma,
-        nest=True,
-        progress_every=dataset_progress_every,
-        progress=log,
+        camb_h0=args.camb_h0,
+        camb_ombh2=args.camb_ombh2,
+        camb_omch2=args.camb_omch2,
+        camb_as=args.camb_as,
+        camb_ns=args.camb_ns,
+        camb_mnu=args.camb_mnu,
+        camb_nonlinear=args.camb_nonlinear,
+        source_z0=args.source_z0,
+        source_alpha=args.source_alpha,
+        source_beta=args.source_beta,
+        source_zmax=args.source_zmax,
+        source_nz=args.source_nz,
     )
+    finite_positive = cl_kappa[np.isfinite(cl_kappa) & (cl_kappa > 0.0)]
+    cl_message = (
+        f"C_ell range=[{finite_positive.min():.3e}, {finite_positive.max():.3e}]"
+        if finite_positive.size
+        else "all C_ell values are zero"
+    )
+    log(f"Using {args.kappa_power_spectrum!r} kappa spectrum: {cl_message}.")
+
+    # Build the clean convergence-field training set in physical units before
+    # standardizing it for the flow model.
+    if args.prior_family == "lognormal":
+        log(
+            "Generating GLASS log-normal convergence maps on the HEALPix sphere "
+            f"(train_size={args.train_size}, nside={args.nside}, lmax={lmax})."
+        )
+        kappa_train_np = generate_glass_lognormal_kappa_dataset(
+            n_samples=args.train_size,
+            nside=args.nside,
+            lmax=lmax,
+            seed=args.seed,
+            amplitude=args.glass_amplitude,
+            spectral_index=args.spectral_index,
+            damping=args.glass_damping,
+            cl_kappa=cl_kappa,
+            gaussian_sigma=args.gaussian_sigma,
+            nest=True,
+            progress_every=dataset_progress_every,
+            progress=log,
+        )
+    elif args.prior_family == "gaussian":
+        log(
+            "Generating GLASS Gaussian convergence maps on the HEALPix sphere "
+            f"(train_size={args.train_size}, nside={args.nside}, lmax={lmax})."
+        )
+        kappa_train_np = generate_glass_gaussian_kappa_dataset(
+            n_samples=args.train_size,
+            nside=args.nside,
+            lmax=lmax,
+            seed=args.seed,
+            amplitude=args.glass_amplitude,
+            spectral_index=args.spectral_index,
+            damping=args.glass_damping,
+            cl_kappa=cl_kappa,
+            remove_dipole=args.gaussian_remove_dipole,
+            nest=True,
+            progress_every=dataset_progress_every,
+            progress=log,
+        )
+    else:
+        raise ValueError(f"Unknown prior_family={args.prior_family!r}.")
     x_train_np, target_stats = standardize_targets(kappa_train_np)
     log("Computing spherical shear maps for gamma scaling and initial observations.")
+
+    # The observation channel consumes shear, not kappa, so we synthesize the
+    # noiseless forward model once and then reuse it for corrupted observations.
     gamma_true = spherical_shear_numpy(
         kappa_train_np[:, 0],
         nside=args.nside,
@@ -328,6 +516,8 @@ def main() -> None:
     data_shape = tuple(x_train.shape[1:])
     npix = int(data_shape[-1])
 
+    # This channel encapsulates the forward model used both for bootstrapping the
+    # first E-step and for re-corrupting reconstructed samples during each M-step.
     channel = SphericalShearObservationChannel(
         nside=args.nside,
         lmax=lmax,
@@ -348,6 +538,8 @@ def main() -> None:
     log("Sampling initial spherical shear noise and masks.")
     observed_train = channel.sample_from_shear(key_obs, gamma_true)
 
+    # UAFlowConfig defines the neural posterior model, while DiffEMConfig controls
+    # the outer EM loop and inner optimization details.
     ua_config = UAFlowConfig(
         image_size=npix,
         nside=args.nside,
@@ -385,13 +577,33 @@ def main() -> None:
 
     config_payload = {
         "dataset": {
+            "prior_family": args.prior_family,
+            "kappa_power_spectrum": args.kappa_power_spectrum,
             "nside": args.nside,
             "npix": npix,
             "lmax": lmax,
             "glass_amplitude": args.glass_amplitude,
             "spectral_index": args.spectral_index,
             "glass_damping": args.glass_damping,
+            "camb": {
+                "h0": args.camb_h0,
+                "ombh2": args.camb_ombh2,
+                "omch2": args.camb_omch2,
+                "as": args.camb_as,
+                "ns": args.camb_ns,
+                "mnu": args.camb_mnu,
+                "nonlinear": args.camb_nonlinear,
+            },
+            "source_distribution": {
+                "type": "smail",
+                "z0": args.source_z0,
+                "alpha": args.source_alpha,
+                "beta": args.source_beta,
+                "zmax": args.source_zmax,
+                "nz": args.source_nz,
+            },
             "gaussian_sigma": args.gaussian_sigma,
+            "gaussian_remove_dipole": args.gaussian_remove_dipole,
             "noise_std": args.noise_std,
             "mask_fraction": args.mask_fraction,
             "hole_radius_deg": args.hole_radius_deg,
@@ -399,7 +611,9 @@ def main() -> None:
             "dataset_progress_every": dataset_progress_every,
             "target_stats": target_stats,
             "gamma_scale": gamma_scale,
+            "bootstrap_iterations": channel.bootstrap_iterations,
             "healpix_order": "NESTED",
+            "observable_ell_min": 2,
         },
         "ua_flow": ua_config.__dict__,
         "diffem": diffem_config.__dict__,
@@ -410,6 +624,8 @@ def main() -> None:
         "n_parameters": None,
     }
 
+    # Build the trainable flow once, then wrap the state in replicated/sharded
+    # containers so the same training code works on one device or many.
     flow = build_ua_flow(ua_config, key=key_model)
     opt = make_optimizer(diffem_config)
     opt_state = opt.init(eqx.filter(flow, eqx.is_array))
@@ -422,6 +638,11 @@ def main() -> None:
     n_parameters = count_parameters(flow.model)
     config_payload["n_parameters"] = int(n_parameters)
     (args.run_dir / "config.json").write_text(json.dumps(config_payload, indent=2, sort_keys=True))
+    np.savez(
+        out_dir / "kappa_power_spectrum.npz",
+        ell=np.arange(lmax + 1, dtype=np.int32),
+        cl_kappa=np.asarray(cl_kappa, dtype=np.float64),
+    )
     log(f"Posterior model parameters: {n_parameters:.3e}")
 
     all_losses: list[float] = []
@@ -434,6 +655,8 @@ def main() -> None:
 
     for em_idx in range(diffem_config.em_steps):
         log(f"EM {em_idx + 1}/{diffem_config.em_steps}: E-step.")
+        # On the very first iteration we can optionally bootstrap with the
+        # analytic channel reconstruction before the learned posterior is useful.
         bootstrap = channel if diffem_config.bootstrap_first_e_step and em_idx == 0 else None
         key, key_e = jr.split(key)
         recon = e_step_reconstruct(
@@ -446,6 +669,16 @@ def main() -> None:
             solver=diffem_config.posterior_solver,
             bootstrap_channel=bootstrap,
         )
+        # Keep reconstructed training targets aligned with the same observable
+        # projection used in previews and downstream comparisons.
+        recon = recon._replace(
+            samples=_project_standardized_kappa_batch(
+                recon.samples,
+                nside=args.nside,
+                lmax=lmax,
+                target_stats=target_stats,
+            )
+        )
 
         log(
             f"EM {em_idx + 1}/{diffem_config.em_steps}: M-step. "
@@ -453,6 +686,8 @@ def main() -> None:
             f"then training for {diffem_config.m_steps_per_em} steps."
         )
         key, key_m = jr.split(key)
+        # The M-step resamples noisy/masked observations from the current latent
+        # reconstructions and fits the posterior model to invert that channel.
         m_result = m_step_train(
             state,
             recon.samples,
@@ -480,6 +715,8 @@ def main() -> None:
         )
 
         key, key_preview = jr.split(key)
+        # Save a small qualitative snapshot after each EM round so we can monitor
+        # both reconstruction quality and calibrated uncertainty over time.
         preview = state.sampling_flow.sample(
             key_preview,
             batch_size=preview_size,
@@ -488,15 +725,22 @@ def main() -> None:
             steps=diffem_config.posterior_sample_steps,
             solver=diffem_config.posterior_solver,
         )
+        preview_samples = _project_standardized_kappa_batch(
+            preview.samples,
+            nside=args.nside,
+            lmax=lmax,
+            target_stats=target_stats,
+        )
         preview_ks = channel.bootstrap_reconstruction(preview_cond)
         save_spherical_preview(
             reconstructions_dir,
             em_idx=em_idx + 1,
             nside=args.nside,
+            lmax=lmax,
             clean=preview_clean,
             observed_condition=np.asarray(jax.device_get(preview_cond)),
             kaiser_squires=np.asarray(jax.device_get(preview_ks)),
-            posterior=np.asarray(jax.device_get(preview.samples)),
+            posterior=np.asarray(jax.device_get(preview_samples)),
             uncertainty=np.asarray(jax.device_get(preview.variance)),
             target_stats=target_stats,
             gamma_scale=gamma_scale,
